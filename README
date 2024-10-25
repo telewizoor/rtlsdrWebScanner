@@ -29,5 +29,6 @@ rtl_fm -f 121.075M -M am -s 10k -E deemp -F 0 -g 40 -l 20 | sox -r 10k -t raw -e
 rtl_fm -f freq_list.txt -M am -s 10k -E deemp -F 0 -g 40 -l 20 | sox -r 10k -t raw -e s -b 16 -c 1 - test.wav
 
 
+
 For more information see:
 https://osmocom.org/projects/rtl-sdr/wiki
