@@ -83,6 +83,7 @@
 #define BUFFER_DUMP			4096
 
 #define FREQUENCIES_LIMIT		1000
+#define FREQUENCY_NAME_LIMIT    32
 
 static volatile int do_exit = 0;
 static int lcm_post[17] = {1,1,1,3,1,5,3,7,1,9,5,11,3,13,7,15,1};
@@ -165,6 +166,7 @@ struct controller_state
 	int      exit_flag;
 	pthread_t thread;
 	uint32_t freqs[FREQUENCIES_LIMIT];
+	char     freqs_names[FREQUENCIES_LIMIT][FREQUENCY_NAME_LIMIT];
 	int      freq_len;
 	int      freq_now;
 	int      edge;
@@ -546,20 +548,80 @@ void fm_demod(struct demod_state *fm)
 	fm->result_len = fm->lp_len/2;
 }
 
+#define AGC_BUFFER_LEN        100
+#define INPUT_THRESHOLD_LEVEL 20
+#define TARGET_OUTPUT_LEVEL   10000
+#define AGC_STEP              0.1f
+
+int16_t agc_signal_buffer[AGC_BUFFER_LEN];
+float   gain = 2.0f;
+
+int16_t calc_avg(int16_t* buf, int buf_len) {
+	int avg = 0;
+	for(int i=0; i<buf_len; i++) {
+		avg += buf[i];
+	}
+	return avg/buf_len;
+}
+
+void calc_gain(float* current_gain) {
+	int16_t avg_sig = abs(calc_avg(agc_signal_buffer, AGC_BUFFER_LEN));
+
+	// fprintf(stderr, "current_gain * avg_sig = %f\n", *current_gain * avg_sig);
+
+	if(avg_sig > INPUT_THRESHOLD_LEVEL) {
+		if(*current_gain * avg_sig > TARGET_OUTPUT_LEVEL) {
+			if(*current_gain > 0) {
+				*current_gain -= AGC_STEP;
+			}
+		} else {
+			*current_gain += AGC_STEP;
+		}
+	}
+}
+
+void add_agc_signal_sample(int16_t signal) {
+	static int i;
+	if(i<AGC_BUFFER_LEN) {
+		agc_signal_buffer[i] = signal;
+		i++;
+	} else {
+		memcpy(agc_signal_buffer, &agc_signal_buffer[1], sizeof(signal) * (AGC_BUFFER_LEN - 1));
+		agc_signal_buffer[i-1] = signal;
+	}
+	// fprintf(stderr, "agc_signal_buffer[0] = %d\n", agc_signal_buffer[0]);
+}
+
+void remove_dc(int16_t* buf, int buf_len, int16_t avg) {
+	for(int i=0; i<buf_len; i++) {
+		buf[i] -= avg;
+	}
+}
+
 void am_demod(struct demod_state *fm)
 // todo, fix this extreme laziness
 {
+	uint8_t sign = 0;
 	int i, pcm;
 	int16_t *lp = fm->lowpassed;
 	int16_t *r  = fm->result;
+
 	for (i = 0; i < fm->lp_len; i += 2) {
-		// hypot uses floats but won't overflow
-		//r[i/2] = (int16_t)hypot(lp[i], lp[i+1]);
 		pcm = lp[i] * lp[i];
 		pcm += lp[i+1] * lp[i+1];
-		r[i/2] = (int16_t)sqrt(pcm) * fm->output_scale;
+		r[i/2] = (int16_t)sqrt(pcm);
+		// fprintf(stderr, "r[i/2] = %d\n", r[i/2]);
+
+		add_agc_signal_sample(r[i/2]);
+		r[i/2] *= gain;
+		calc_gain(&gain);
 	}
 	fm->result_len = fm->lp_len/2;
+
+	remove_dc(r, fm->result_len, calc_avg(r, fm->result_len));
+
+	// fprintf(stderr, "gain = %f\n", gain);
+
 	// lowpass? (3khz)  highpass?  (dc)
 }
 
@@ -909,6 +971,8 @@ static void *controller_thread_fn(void *arg)
 	verbose_set_sample_rate(dongle.dev, dongle.rate);
 	fprintf(stderr, "Output at %u Hz.\n", demod.rate_in/demod.post_downsample);
 
+	fprintf(stderr, "\rCurrent f = [%s] %d", s->freqs_names[0], s->freqs[0]);
+
 	while (!do_exit) {
 		safe_cond_wait(&s->hop, &s->hop_m);
 		if (s->freq_len <= 1) {
@@ -916,6 +980,7 @@ static void *controller_thread_fn(void *arg)
 		/* hacky hopping */
 		s->freq_now = (s->freq_now + 1) % s->freq_len;
 		optimal_settings(s->freqs[s->freq_now], demod.rate_in);
+		fprintf(stderr, "\rCurrent f = [%s] %d", s->freqs_names[s->freq_now], s->freqs[s->freq_now]);
 		rtlsdr_set_center_freq(dongle.dev, dongle.freq);
 		dongle.mute = BUFFER_DUMP;
 	}
@@ -1074,10 +1139,33 @@ int main(int argc, char **argv)
 			if (controller.freq_len >= FREQUENCIES_LIMIT) {
 				break;}
 			if (strchr(optarg, ':'))
-				{frequency_range(&controller, optarg);}
+				{frequency_range(&controller, optarg);
+			// Check if file is passed isntead of freqs. TODO: checking for .txt isnt so nice(?)
+			} else if (strstr(optarg, ".txt")) {
+				fprintf(stderr, "Frequency list file: %s\n", optarg);
+				FILE * pFreqListFile;
+				pFreqListFile = fopen(optarg, "r");
+				if (pFreqListFile!=NULL)
+				{
+					uint32_t freq=0;
+					char name[FREQUENCY_NAME_LIMIT];
+					while(0 < fscanf(pFreqListFile, "%d", &freq)) {
+						controller.freqs[controller.freq_len] = freq;
+						// Try to read channel name from input file
+						memset(name, ' ', FREQUENCY_NAME_LIMIT);
+						if(0 < fscanf(pFreqListFile, "%s", name)) {
+							strncpy(controller.freqs_names[controller.freq_len], name, FREQUENCY_NAME_LIMIT);
+						}
+						fprintf(stderr, "Frequency added: %d %s\n", controller.freqs[controller.freq_len], controller.freqs_names[controller.freq_len]);
+						controller.freq_len++;
+					}
+					fclose (pFreqListFile);
+				}
+			}
 			else
 			{
 				controller.freqs[controller.freq_len] = (uint32_t)atofs(optarg);
+				fprintf(stderr, "Frequency added: %d\n", controller.freqs[controller.freq_len]);
 				controller.freq_len++;
 			}
 			break;
