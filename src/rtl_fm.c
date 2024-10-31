@@ -169,10 +169,25 @@ struct controller_state
 	char     freqs_names[FREQUENCIES_LIMIT][FREQUENCY_NAME_LIMIT];
 	int      freq_len;
 	int      freq_now;
+	int      locked[FREQUENCIES_LIMIT];
 	int      edge;
 	int      wb_mode;
 	pthread_cond_t hop;
 	pthread_mutex_t hop_m;
+};
+
+struct display_state
+{
+	pthread_t thread;
+	uint32_t freqs[FREQUENCIES_LIMIT];
+	char     freqs_names[FREQUENCIES_LIMIT][FREQUENCY_NAME_LIMIT];
+	int      freq_now;
+	int      squelch_status;
+	int      locked[FREQUENCIES_LIMIT];
+	int      rms;
+	pthread_rwlock_t rw;
+	pthread_cond_t ready;
+	pthread_mutex_t ready_m;
 };
 
 // multiple of these, eventually
@@ -180,6 +195,7 @@ struct dongle_state dongle;
 struct demod_state demod;
 struct output_state output;
 struct controller_state controller;
+struct display_state display;
 
 void usage(void)
 {
@@ -550,11 +566,12 @@ void fm_demod(struct demod_state *fm)
 
 #define AGC_BUFFER_LEN        100
 #define INPUT_THRESHOLD_LEVEL 20
-#define TARGET_OUTPUT_LEVEL   10000
+#define TARGET_OUTPUT_LEVEL   14000
+#define DEFAULT_GAIN          2.0f
 #define AGC_STEP              0.1f
 
 int16_t agc_signal_buffer[AGC_BUFFER_LEN];
-float   gain = 2.0f;
+float   agc_gain = 2.0f;
 
 int16_t calc_avg(int16_t* buf, int buf_len) {
 	int avg = 0;
@@ -613,14 +630,14 @@ void am_demod(struct demod_state *fm)
 		// fprintf(stderr, "r[i/2] = %d\n", r[i/2]);
 
 		add_agc_signal_sample(r[i/2]);
-		r[i/2] *= gain;
-		calc_gain(&gain);
+		r[i/2] *= agc_gain;
+		calc_gain(&agc_gain);
 	}
 	fm->result_len = fm->lp_len/2;
 
-	remove_dc(r, fm->result_len, calc_avg(r, fm->result_len));
+	// remove_dc(r, fm->result_len, calc_avg(r, fm->result_len));
 
-	// fprintf(stderr, "gain = %f\n", gain);
+	// fprintf(stderr, "agc_gain = %f\n", agc_gain);
 
 	// lowpass? (3khz)  highpass?  (dc)
 }
@@ -816,12 +833,17 @@ void full_demod(struct demod_state *d)
 	/* power squelch */
 	if (d->squelch_level) {
 		sr = rms(d->lowpassed, d->lp_len, 1);
+		display.rms = sr;
+		// fprintf(stderr, "\nCurrent RMS=%d", sr);
 		if (sr < d->squelch_level) {
+			display.squelch_status = 1;
 			d->squelch_hits++;
+			agc_gain = DEFAULT_GAIN;
 			for (i=0; i<d->lp_len; i++) {
 				d->lowpassed[i] = 0;
 			}
 		} else {
+			display.squelch_status = 0;
 			d->squelch_hits = 0;}
 	}
 	d->mode_demod(d);  /* lowpassed -> result */
@@ -931,7 +953,7 @@ static void optimal_settings(int freq, int rate)
 	capture_rate = dm->downsample * dm->rate_in;
 	if (!d->offset_tuning) {
 		capture_freq = freq + capture_rate/4;}
-	capture_freq += cs->edge * dm->rate_in / 2;
+	// capture_freq += cs->edge * dm->rate_in / 2;
 	dm->output_scale = (1<<15) / (128 * dm->downsample);
 	if (dm->output_scale < 1) {
 		dm->output_scale = 1;}
@@ -954,7 +976,13 @@ static void *controller_thread_fn(void *arg)
 	}
 
 	/* set up primary channel */
-	optimal_settings(s->freqs[0], demod.rate_in);
+	i = 0;
+	while(s->locked[i]) {
+		i++;
+	}
+	s->freq_now = i;
+	optimal_settings(s->freqs[i], demod.rate_in);
+
 	if (dongle.direct_sampling) {
 		verbose_direct_sampling(dongle.dev, dongle.direct_sampling);}
 	if (dongle.offset_tuning) {
@@ -971,18 +999,52 @@ static void *controller_thread_fn(void *arg)
 	verbose_set_sample_rate(dongle.dev, dongle.rate);
 	fprintf(stderr, "Output at %u Hz.\n", demod.rate_in/demod.post_downsample);
 
-	fprintf(stderr, "\rCurrent f = [%s] %d", s->freqs_names[0], s->freqs[0]);
-
 	while (!do_exit) {
 		safe_cond_wait(&s->hop, &s->hop_m);
 		if (s->freq_len <= 1) {
 			continue;}
+
 		/* hacky hopping */
 		s->freq_now = (s->freq_now + 1) % s->freq_len;
-		optimal_settings(s->freqs[s->freq_now], demod.rate_in);
-		fprintf(stderr, "\rCurrent f = [%s] %d", s->freqs_names[s->freq_now], s->freqs[s->freq_now]);
-		rtlsdr_set_center_freq(dongle.dev, dongle.freq);
+		display.freq_now = s->freq_now;
+
+		if(!s->locked[s->freq_now]) {
+			optimal_settings(s->freqs[s->freq_now], demod.rate_in);
+			rtlsdr_set_center_freq(dongle.dev, dongle.freq);
+		}
 		dongle.mute = BUFFER_DUMP;
+	}
+	return 0;
+}
+
+#define DISPLAY_TASK_INTERVAL 500 /* ms */
+
+static void *display_thread_fn(void *arg)
+{
+	struct display_state *s = arg;
+
+	uint32_t old_freq = 0;
+	uint8_t  scanning = 0;
+
+	while (!do_exit) {
+		// use timedwait and pad out under runs
+		safe_cond_wait(&s->ready, &s->ready_m);
+		pthread_rwlock_rdlock(&s->rw);
+
+		// if(!s->squelch_status) { //s->freqs[s->freq_now] != old_freq || 
+			fprintf(stderr, "\rCH%.3d Name=%.*s f=%3.3fMHz RMS=%d", s->freq_now + 1, FREQUENCY_NAME_LIMIT, s->freqs_names[s->freq_now], s->freqs[s->freq_now]/1000000.0, s->rms);
+			old_freq = s->freqs[s->freq_now];
+			scanning = 0;
+		// }
+
+		if(s->squelch_status) {
+			// fprintf(stderr, "\rScanning...");
+			scanning = 1;
+		}
+
+		old_freq = s->freqs[s->freq_now];
+		usleep(DISPLAY_TASK_INTERVAL * 1000);
+		pthread_rwlock_unlock(&s->rw);
 	}
 	return 0;
 }
@@ -1028,6 +1090,13 @@ void dongle_init(struct dongle_state *s)
 	s->direct_sampling = 0;
 	s->offset_tuning = 0;
 	s->demod_target = &demod;
+}
+
+void display_init(struct display_state *s)
+{
+	pthread_rwlock_destroy(&s->rw);
+	pthread_cond_destroy(&s->ready);
+	pthread_mutex_destroy(&s->ready_m);
 }
 
 void demod_init(struct demod_state *s)
@@ -1115,6 +1184,9 @@ void sanity_checks(void)
 
 }
 
+#define StringifyHelper(x)  #x
+#define Stringify(x)        StringifyHelper(x)
+
 int main(int argc, char **argv)
 {
 #ifndef _WIN32
@@ -1128,6 +1200,7 @@ int main(int argc, char **argv)
 	demod_init(&demod);
 	output_init(&output);
 	controller_init(&controller);
+	display_init(&display);
 
 	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:E:F:A:M:hT")) != -1) {
 		switch (opt) {
@@ -1147,16 +1220,32 @@ int main(int argc, char **argv)
 				pFreqListFile = fopen(optarg, "r");
 				if (pFreqListFile!=NULL)
 				{
-					uint32_t freq=0;
+					uint32_t num = 0;
+					uint32_t freq = 0;
+					uint32_t locked = 0;
+					uint32_t dummy_int = 0;
 					char name[FREQUENCY_NAME_LIMIT];
-					while(0 < fscanf(pFreqListFile, "%d", &freq)) {
+					char dummy[FREQUENCY_NAME_LIMIT];
+
+					/* Read line by line */
+					while(0 < fscanf(pFreqListFile, "%3[^,],%d,%" Stringify(FREQUENCY_NAME_LIMIT) "[^,],%d,%5[^,],%d,%d,%d,%d \n", dummy, &num, name, &freq, dummy, &dummy_int, &dummy_int, &locked, &dummy_int)) {
+						/* To get f in [Hz] */
+						freq *= 100;
+
+						fprintf(stderr, "Frequency added: %.3d | %s | %d | locked: %d\n", num, name, freq, locked);
+
+						/* frequency */
 						controller.freqs[controller.freq_len] = freq;
-						// Try to read channel name from input file
-						memset(name, ' ', FREQUENCY_NAME_LIMIT);
-						if(0 < fscanf(pFreqListFile, "%s", name)) {
-							strncpy(controller.freqs_names[controller.freq_len], name, FREQUENCY_NAME_LIMIT);
-						}
-						fprintf(stderr, "Frequency added: %d %s\n", controller.freqs[controller.freq_len], controller.freqs_names[controller.freq_len]);
+						display.freqs[controller.freq_len] = freq;
+
+						/* channel name */
+						strncpy(controller.freqs_names[controller.freq_len], name, FREQUENCY_NAME_LIMIT);
+						strncpy(display.freqs_names[controller.freq_len], name, FREQUENCY_NAME_LIMIT);
+
+						/* locked? */
+						controller.locked[controller.freq_len] = locked;
+						display.locked[controller.freq_len] = locked;
+
 						controller.freq_len++;
 					}
 					fclose (pFreqListFile);
@@ -1344,6 +1433,8 @@ int main(int argc, char **argv)
 	pthread_create(&output.thread, NULL, output_thread_fn, (void *)(&output));
 	pthread_create(&demod.thread, NULL, demod_thread_fn, (void *)(&demod));
 	pthread_create(&dongle.thread, NULL, dongle_thread_fn, (void *)(&dongle));
+	usleep(100000);
+	pthread_create(&display.thread, NULL, display_thread_fn, (void *)(&display));
 
 	while (!do_exit) {
 		usleep(100000);
@@ -1362,6 +1453,8 @@ int main(int argc, char **argv)
 	pthread_join(output.thread, NULL);
 	safe_cond_signal(&controller.hop, &controller.hop_m);
 	pthread_join(controller.thread, NULL);
+	safe_cond_signal(&display.ready, &display.ready_m);
+	pthread_join(display.thread, NULL);
 
 	//dongle_cleanup(&dongle);
 	demod_cleanup(&demod);
